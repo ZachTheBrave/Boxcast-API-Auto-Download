@@ -1,0 +1,58 @@
+# -------------------------
+# Python cache / bytecode
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# -------------------------
+# Editor / IDE settings
+# -------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -------------------------
+# OS trash
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Project log/state files
+# -------------------------
+*.log
+boxcast_download.log
+cron.log
+boxcast_state.json
+
+# -------------------------
+# Security vault files
+# DO NOT COMMIT THESE
+# -------------------------
+vault.key
+vault.bin
+
+# -------------------------
+# Other project-specific ignores
+# -------------------------
+# If testing output goes here, ignore
+test_output/
