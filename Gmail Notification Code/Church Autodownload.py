@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import subprocess
 import requests
 import logging
 from typing import Optional, List, Dict
@@ -83,15 +84,14 @@ GMAIL_USER = _secrets["gmail_user"]
 GMAIL_APP_PASSWORD = _secrets["gmail_app_password"]
 NOTIFY_TO: List[str] = _secrets["notify_to"]
 
-# Change this to wherever you want downloads to land.
-# On Ubuntu/RasPi you might mount your NAS at /mnt/boxcast.
-BASE_DIR = r"C:\Users\zacpi\Downloads\test"
+# Where downloads should land (your NAS mount on the Pi)
+BASE_DIR = "/mnt/synology"
 
 AUTH_URL = "https://rest.boxcast.com/oauth2/token"
 API_BASE = "https://rest.boxcast.com"
 
 # Only process broadcasts that start on/after this date (UTC)
-START_DATE = datetime(2025, 11, 30, 0, 0, 0, tzinfo=timezone.utc)
+START_DATE = datetime(2025, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
 
 # Your time zone
 LOCAL_TZ = ZoneInfo("America/Chicago")
@@ -118,17 +118,24 @@ logging.basicConfig(
 # ========== STATE HELPERS ==========
 
 def load_state() -> Dict:
+    """
+    Load state from JSON and ensure 'downloaded_recordings' exists as a dict.
+    """
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if not isinstance(data, dict):
-                return {}
-            return data
+                data = {}
     except FileNotFoundError:
-        return {}
+        data = {}
     except Exception as e:
         logging.error("Error loading state file: %s", e)
-        return {}
+        data = {}
+
+    if "downloaded_recordings" not in data or not isinstance(data["downloaded_recordings"], dict):
+        data["downloaded_recordings"] = {}
+
+    return data
 
 
 def save_state(state: Dict):
@@ -230,7 +237,7 @@ def send_email(subject: str, body: str):
 
 def send_notification(subject: str, body: str):
     """
-    Sends a single notification email (e.g., for uncategorized, missing schedule, etc.).
+    Sends a single notification email (e.g., for uncategorized, missing schedule, NAS issues, etc.).
     """
     logging.warning("NOTIFICATION: %s -- %s", subject, body.replace("\n", " | "))
     send_email(subject, body)
@@ -254,6 +261,57 @@ def send_run_summary(downloads: List[Dict]):
         body = "\n".join(lines)
 
     send_email("BoxCast Download Summary", body)
+
+
+# ========== NAS MOUNT HEALTH CHECK ==========
+
+def ensure_nas_mounted() -> bool:
+    """
+    Ensure BASE_DIR is a mounted filesystem.
+    - If it's already mounted: return True.
+    - If not: try `mount BASE_DIR`, then `mount -a`.
+    - If still not mounted: send email alert and return False.
+    """
+    if os.path.ismount(BASE_DIR):
+        logging.info("NAS mount OK: %s is mounted.", BASE_DIR)
+        return True
+
+    logging.warning("NAS base dir %s is not mounted. Attempting to mount...", BASE_DIR)
+
+    # Try mounting the specific mount point
+    try:
+        subprocess.run(["mount", BASE_DIR], check=False)
+    except Exception as e:
+        logging.error("Error running 'mount %s': %s", BASE_DIR, e)
+
+    time.sleep(2)
+
+    if os.path.ismount(BASE_DIR):
+        logging.info("NAS mount successful after 'mount %s'.", BASE_DIR)
+        return True
+
+    # Fallback: try mount -a
+    logging.warning("Trying 'mount -a' as fallback...")
+    try:
+        subprocess.run(["mount", "-a"], check=False)
+    except Exception as e:
+        logging.error("Error running 'mount -a': %s", e)
+
+    time.sleep(2)
+
+    if os.path.ismount(BASE_DIR):
+        logging.info("NAS mount successful after 'mount -a'.")
+        return True
+
+    # Still not mounted -> abort downloads
+    msg = (
+        f"NAS base directory `{BASE_DIR}` is NOT mounted after automatic attempts.\n"
+        "Skipping BoxCast downloads for this run. "
+        "Please check Synology, network, or /etc/fstab configuration."
+    )
+    logging.error(msg)
+    send_notification("NAS Mount Failed", msg)
+    return False
 
 
 # ========== SUNDAY ROUTING HELPERS ==========
@@ -307,6 +365,7 @@ def pick_sunday_folder_and_filename(
 
 
 def compute_christmas_at_carbondale_filename(dest_dir: str, year: int) -> str:
+    base = f"{year} Christmas At Carbondale"
     base = f"{year} Christmas At Carbondale"
     first_path = os.path.join(dest_dir, base + ".mp4")
     if not os.path.exists(first_path):
@@ -485,8 +544,9 @@ def weekly_analytics(token: str, state: Dict) -> Dict:
     """
     Once per week (Monday), look back at the previous 7 days and summarize:
       - Sunday 1st/2nd Service
+      - Sunday Night
       - Wednesday Night
-      - Holiday, Memorial, Christmas at Carbondale, Youth, Other
+      - Holiday, Memorial, Christmas at Carbondale, Weddings, Special Services, Youth, Other
     For each: scheduled count + how many have recordings.
     Sends an email summary.
     """
@@ -527,10 +587,13 @@ def weekly_analytics(token: str, state: Dict) -> Dict:
     stats = {
         "sunday_1st": {"scheduled": 0, "recordings": 0},
         "sunday_2nd": {"scheduled": 0, "recordings": 0},
+        "sunday_night": {"scheduled": 0, "recordings": 0},
         "wednesday": {"scheduled": 0, "recordings": 0},
         "holiday": {"scheduled": 0, "recordings": 0},
         "memorial": {"scheduled": 0, "recordings": 0},
         "christmas_at_carbondale": {"scheduled": 0, "recordings": 0},
+        "wedding": {"scheduled": 0, "recordings": 0},
+        "special_services": {"scheduled": 0, "recordings": 0},
         "youth": {"scheduled": 0, "recordings": 0},
         "other": {"scheduled": 0, "recordings": 0},
     }
@@ -551,6 +614,8 @@ def weekly_analytics(token: str, state: Dict) -> Dict:
             cat = "youth"
         elif "memorial" in name_lower:
             cat = "memorial"
+        elif "wedding" in name_lower:
+            cat = "wedding"
         elif "christmas at carbondale" in name_lower:
             cat = "christmas_at_carbondale"
         else:
@@ -558,30 +623,46 @@ def weekly_analytics(token: str, state: Dict) -> Dict:
             if holiday:
                 cat = "holiday"
             else:
-                # Sunday windows
-                if wday == 6:
-                    s1_start = datetime.combine(day, dtime(0, 0), tzinfo=LOCAL_TZ)
-                    s1_end = datetime.combine(day, dtime(10, 0), tzinfo=LOCAL_TZ)
-
-                    s2_start = datetime.combine(day, dtime(10, 50), tzinfo=LOCAL_TZ)
-                    s2_end = datetime.combine(day, dtime(13, 0), tzinfo=LOCAL_TZ)
-
-                    if interval_overlaps(local_start, local_end, s1_start, s1_end):
-                        cat = "sunday_1st"
-                    elif interval_overlaps(local_start, local_end, s2_start, s2_end):
-                        cat = "sunday_2nd"
-                    else:
-                        cat = "other"
-                # Wednesday night window: 18:00–21:00
-                elif wday == 2:
-                    w_start = datetime.combine(day, dtime(18, 0), tzinfo=LOCAL_TZ)
-                    w_end = datetime.combine(day, dtime(21, 0), tzinfo=LOCAL_TZ)
-                    if interval_overlaps(local_start, local_end, w_start, w_end):
-                        cat = "wednesday"
-                    else:
-                        cat = "other"
+                # non-holiday special services by name
+                if (
+                    "special service" in name_lower
+                    or "revival" in name_lower
+                    or "missions service" in name_lower
+                ):
+                    cat = "special_services"
                 else:
-                    cat = "other"
+                    # Sunday / Wednesday / other by time
+                    if wday == 6:  # Sunday
+                        s1_start = datetime.combine(day, dtime(0, 0), tzinfo=LOCAL_TZ)
+                        s1_end = datetime.combine(day, dtime(10, 0), tzinfo=LOCAL_TZ)
+
+                        s2_start = datetime.combine(day, dtime(10, 50), tzinfo=LOCAL_TZ)
+                        s2_end = datetime.combine(day, dtime(13, 0), tzinfo=LOCAL_TZ)
+
+                        if interval_overlaps(local_start, local_end, s1_start, s1_end):
+                            cat = "sunday_1st"
+                        elif interval_overlaps(local_start, local_end, s2_start, s2_end):
+                            cat = "sunday_2nd"
+                        else:
+                            # Sunday night 17:00–22:00 or name contains "Sunday Night"
+                            sn_start = datetime.combine(day, dtime(17, 0), tzinfo=LOCAL_TZ)
+                            sn_end = datetime.combine(day, dtime(22, 0), tzinfo=LOCAL_TZ)
+                            if (
+                                "sunday night" in name_lower
+                                or interval_overlaps(local_start, local_end, sn_start, sn_end)
+                            ):
+                                cat = "sunday_night"
+                            else:
+                                cat = "other"
+                    elif wday == 2:  # Wednesday
+                        w_start = datetime.combine(day, dtime(18, 0), tzinfo=LOCAL_TZ)
+                        w_end = datetime.combine(day, dtime(21, 0), tzinfo=LOCAL_TZ)
+                        if interval_overlaps(local_start, local_end, w_start, w_end):
+                            cat = "wednesday"
+                        else:
+                            cat = "other"
+                    else:
+                        cat = "other"
 
         stats[cat]["scheduled"] += 1
         if has_rec:
@@ -594,16 +675,31 @@ def weekly_analytics(token: str, state: Dict) -> Dict:
         f"Weekly BoxCast Summary",
         f"Period: {week_start_display} to {week_end_display}",
         "",
-        f"- Sunday 1st Service: scheduled {stats['sunday_1st']['scheduled']}, recordings {stats['sunday_1st']['recordings']}",
-        f"- Sunday 2nd Service: scheduled {stats['sunday_2nd']['scheduled']}, recordings {stats['sunday_2nd']['recordings']}",
-        f"- Wednesday Night: scheduled {stats['wednesday']['scheduled']}, recordings {stats['wednesday']['recordings']}",
+        f"- Sunday 1st Service: scheduled {stats['sunday_1st']['scheduled']}, "
+        f"recordings {stats['sunday_1st']['recordings']}",
+        f"- Sunday 2nd Service: scheduled {stats['sunday_2nd']['scheduled']}, "
+        f"recordings {stats['sunday_2nd']['recordings']}",
+        f"- Sunday Night: scheduled {stats['sunday_night']['scheduled']}, "
+        f"recordings {stats['sunday_night']['recordings']}",
+        f"- Wednesday Night: scheduled {stats['wednesday']['scheduled']}, "
+        f"recordings {stats['wednesday']['recordings']}",
         "",
-        f"- Holiday Services: scheduled {stats['holiday']['scheduled']}, recordings {stats['holiday']['recordings']}",
-        f"- Memorial Services: scheduled {stats['memorial']['scheduled']}, recordings {stats['memorial']['recordings']}",
-        f"- Christmas at Carbondale: scheduled {stats['christmas_at_carbondale']['scheduled']}, recordings {stats['christmas_at_carbondale']['recordings']}",
+        f"- Holiday Services: scheduled {stats['holiday']['scheduled']}, "
+        f"recordings {stats['holiday']['recordings']}",
+        f"- Special Services (non-holiday): scheduled {stats['special_services']['scheduled']}, "
+        f"recordings {stats['special_services']['recordings']}",
+        f"- Memorial Services: scheduled {stats['memorial']['scheduled']}, "
+        f"recordings {stats['memorial']['recordings']}",
+        f"- Weddings: scheduled {stats['wedding']['scheduled']}, "
+        f"recordings {stats['wedding']['recordings']}",
+        f"- Christmas at Carbondale: scheduled "
+        f"{stats['christmas_at_carbondale']['scheduled']}, "
+        f"recordings {stats['christmas_at_carbondale']['recordings']}",
         "",
-        f"- Youth Services: scheduled {stats['youth']['scheduled']}, recordings {stats['youth']['recordings']}",
-        f"- Other: scheduled {stats['other']['scheduled']}, recordings {stats['other']['recordings']}",
+        f"- Youth Services: scheduled {stats['youth']['scheduled']}, "
+        f"recordings {stats['youth']['recordings']}",
+        f"- Other: scheduled {stats['other']['scheduled']}, "
+        f"recordings {stats['other']['recordings']}",
     ]
 
     send_email("Weekly BoxCast Summary", "\n".join(lines))
@@ -615,21 +711,30 @@ def weekly_analytics(token: str, state: Dict) -> Dict:
 # ========== MAIN SCRIPT ==========
 
 def main():
-    logging.info("========== BoxCast Auto Downloader Started ==========")
-    logging.info("Local download directory: %s", BASE_DIR)
+    logging.info("========== BoxCast Auto Downloader (Gmail) Started ==========")
+    logging.info("Local download directory (NAS): %s", BASE_DIR)
     logging.info("Filtering broadcasts starting on/after %s (UTC)", START_DATE)
 
     state = load_state()
     token = get_token()
 
     # Live stream monitoring (start/end alerts)
-    state = monitor_live_streams(token, state)
+    # state = monitor_live_streams(token, state)
 
     # Future-week schedule check (once per day)
-    state = check_expected_schedule(token, state)
+    # state = check_expected_schedule(token, state)
 
-    # Weekly analytics (once per week, on Monday)
+    # Weekly analytics (once per week, on Monday) – does NOT depend on NAS mount
     state = weekly_analytics(token, state)
+
+    # Ensure NAS is mounted BEFORE we attempt any downloads
+    if not ensure_nas_mounted():
+        # Save state changes (e.g., weekly analytics timestamp) and bail out
+        save_state(state)
+        print("\nNAS is not mounted. No downloads performed this run.")
+        print("Log file:", LOG_FILE)
+        print("State file:", STATE_FILE)
+        return
 
     download_count = 0
     downloads_info: List[Dict] = []
@@ -669,11 +774,24 @@ def main():
             logging.info("Skipping Youth Service broadcast: %s", name)
             continue
 
+        # Base Sunday routing
         dest_dir, filename, sunday_subfolder = pick_sunday_folder_and_filename(
             starts_at_utc, ends_at_utc
         )
 
         special_category = "normal"
+
+        # Compute local times once
+        local_start = starts_at_utc.astimezone(LOCAL_TZ)
+        if ends_at_utc:
+            local_end = ends_at_utc.astimezone(LOCAL_TZ)
+        else:
+            local_end = local_start + timedelta(hours=2)
+
+        day = local_start.date()
+        wday = local_start.weekday()
+
+        # ---- Name-based special categories ----
 
         # Memorial services
         if "memorial" in name_lower:
@@ -682,32 +800,74 @@ def main():
             os.makedirs(dest_dir, exist_ok=True)
             filename = make_safe_filename(name) + ".mp4"
 
+        # Weddings
+        elif "wedding" in name_lower:
+            special_category = "wedding"
+            dest_dir = os.path.join(BASE_DIR, "Weddings")
+            os.makedirs(dest_dir, exist_ok=True)
+            base_name = f"{local_start:%Y-%m-%d} - {name}"
+            filename = make_safe_filename(base_name) + ".mp4"
+
         # Christmas at Carbondale
         elif "christmas at carbondale" in name_lower:
             special_category = "christmas_at_carbondale"
             dest_dir = os.path.join(BASE_DIR, "Christmas At Carbondale")
             os.makedirs(dest_dir, exist_ok=True)
-            local_start = starts_at_utc.astimezone(LOCAL_TZ)
             year = local_start.year
             filename = compute_christmas_at_carbondale_filename(dest_dir, year)
 
         else:
-            # Holiday services
+            # Holiday services (stored under Special Services folder)
             holiday = detect_holiday(name_lower)
             if holiday:
                 special_category = "holiday"
-                dest_dir = os.path.join(BASE_DIR, "Holiday Services")
+                dest_dir = os.path.join(BASE_DIR, "Special Services")
                 os.makedirs(dest_dir, exist_ok=True)
-                local_start = starts_at_utc.astimezone(LOCAL_TZ)
                 year = local_start.year
                 filename = f"{year} {holiday}.mp4"
+            else:
+                # Other named "Special Services" style events
+                if (
+                    "special service" in name_lower
+                    or "revival" in name_lower
+                    or "missions service" in name_lower
+                ):
+                    special_category = "special_services"
+                    dest_dir = os.path.join(BASE_DIR, "Special Services")
+                    os.makedirs(dest_dir, exist_ok=True)
+                    base_name = f"{local_start:%Y-%m-%d} - {name}"
+                    filename = make_safe_filename(base_name) + ".mp4"
 
-        # Uncategorized (no Sunday slot + no special category)
+        # ---- Time-based routing for Wednesday & Sunday Night ----
+        if special_category == "normal":
+            # Wednesday night window: 18:00–21:00
+            if wday == 2:  # Wednesday
+                w_start = datetime.combine(day, dtime(18, 0), tzinfo=LOCAL_TZ)
+                w_end = datetime.combine(day, dtime(21, 0), tzinfo=LOCAL_TZ)
+                if interval_overlaps(local_start, local_end, w_start, w_end):
+                    special_category = "wednesday"
+                    dest_dir = os.path.join(BASE_DIR, "Wednesday")
+                    os.makedirs(dest_dir, exist_ok=True)
+                    filename = f"{local_start:%Y-%m-%d}.mp4"
+
+        if special_category == "normal" and sunday_subfolder is None and wday == 6:
+            # Sunday Night: 17:00–22:00 or name contains "Sunday Night"
+            sn_start = datetime.combine(day, dtime(17, 0), tzinfo=LOCAL_TZ)
+            sn_end = datetime.combine(day, dtime(22, 0), tzinfo=LOCAL_TZ)
+            if (
+                "sunday night" in name_lower
+                or interval_overlaps(local_start, local_end, sn_start, sn_end)
+            ):
+                special_category = "sunday_night"
+                dest_dir = os.path.join(BASE_DIR, "Sunday Night")
+                os.makedirs(dest_dir, exist_ok=True)
+                filename = f"{local_start:%Y-%m-%d}.mp4"
+
+        # ---- Uncategorized (no Sunday slot + no special category) ----
         if sunday_subfolder is None and special_category == "normal":
             special_category = "uncategorized"
             dest_dir = os.path.join(BASE_DIR, "Uncategorized")
             os.makedirs(dest_dir, exist_ok=True)
-            local_start = starts_at_utc.astimezone(LOCAL_TZ)
             base_name = f"{local_start:%Y-%m-%d} - {name}"
             filename = make_safe_filename(base_name) + ".mp4"
 
@@ -722,11 +882,16 @@ def main():
             )
 
         outfile = os.path.join(dest_dir, filename)
-        logging.info("Broadcast: %s | category=%s -> %s",
-                     name, special_category, outfile)
+        logging.info(
+            "Broadcast: %s | category=%s -> %s",
+            name,
+            special_category if special_category != "normal" else (sunday_subfolder or "normal"),
+            outfile,
+        )
 
+        # If file already exists on disk, skip
         if os.path.exists(outfile):
-            logging.info("Already exists, skipping.")
+            logging.info("Already exists on disk, skipping.")
             continue
 
         detail_resp = api_get(f"/account/broadcasts/{bid}", token)
@@ -735,6 +900,15 @@ def main():
 
         if not recording_id:
             logging.warning("No recording_id for %s", name)
+            continue
+
+        # NEW: skip if we've already downloaded this recording_id before
+        downloaded = state.get("downloaded_recordings", {})
+        if recording_id in downloaded:
+            logging.info(
+                "Recording %s (%s) already downloaded previously as %s, skipping.",
+                recording_id, name, downloaded[recording_id]
+            )
             continue
 
         logging.info("Requesting export for recording %s", recording_id)
@@ -775,6 +949,9 @@ def main():
                     "path": outfile,
                 })
 
+                # Remember this recording_id as downloaded
+                state.setdefault("downloaded_recordings", {})[recording_id] = outfile
+
                 break
 
             elif status.startswith("failed"):
@@ -784,7 +961,7 @@ def main():
             else:
                 time.sleep(POLL_INTERVAL)
 
-    logging.info("========== BoxCast Auto Downloader Finished ==========")
+    logging.info("========== BoxCast Auto Downloader (Gmail) Finished ==========")
     logging.info("Downloads this run: %d", download_count)
 
     # Run summary email
